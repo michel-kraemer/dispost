@@ -1,0 +1,19 @@
+[package]
+name = "dispost"
+description = "Event bus based on strongly-consistent distributed data structures"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dashmap = "6.2.1"
+distruct = { git = "https://github.com/michel-kraemer/distruct" }
+log = "0.4.34"
+postcard = { version = "1.1.3", features = ["alloc"] }
+quinn = "0.11.11"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+tokio = { version = "1.54.0", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal"] }
+tracing = "0.1.44"
+
+[workspace]
+members = ["examples/chat"]

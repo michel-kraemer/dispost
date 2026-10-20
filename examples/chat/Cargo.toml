@@ -1,0 +1,16 @@
+[package]
+name = "chat"
+description = "Event bus based on strongly-consistent distributed data structures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+dispost = { path = "../.." }
+distruct = { git = "https://github.com/michel-kraemer/distruct" }
+log = "0.4.34"
+rustyline-async = "0.4.9"
+tokio = { version = "1.54.0", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
