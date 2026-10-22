@@ -11,7 +11,7 @@ pub fn Ok<T>(value: T) -> Result<T> {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("cluster error: {0}")]
-    Cluster(#[from] distruct::Error),
+    Cluster(#[from] distruct::error::Error),
 
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
