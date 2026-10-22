@@ -441,6 +441,7 @@ dependencies = [
  "log",
  "postcard",
  "quinn",
+ "rand 0.10.3",
  "serde",
  "thiserror 2.0.21",
  "tokio",

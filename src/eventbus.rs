@@ -14,6 +14,7 @@ use quinn::{
         pki_types::{CertificateDer, PrivateKeyDer},
     },
 };
+use rand::seq::IndexedRandom as _;
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     oneshot,
@@ -226,8 +227,13 @@ impl EventBus {
             reply_address: None,
         };
 
-        // TODO implement round-robin or some other strategy
-        if let Some(s) = self.remote_subscribers.get(address).await?.first() {
+        // TODO implement proper round-robin and other strategies
+        if let Some(s) = self
+            .remote_subscribers
+            .get(address)
+            .await?
+            .choose(&mut rand::rng())
+        {
             self.send_to(s, &message).await
         } else {
             Ok(())
@@ -254,9 +260,9 @@ impl EventBus {
         address: &str,
         message: &[u8],
     ) -> Result<Option<oneshot::Receiver<Arc<Message>>>> {
-        // TODO implement round-robin or some other strategy
+        // TODO implement proper round-robin and other strategies
         let ss = self.remote_subscribers.get(address).await?;
-        let Some(remote_subscriber) = ss.first() else {
+        let Some(remote_subscriber) = ss.choose(&mut rand::rng()) else {
             return Ok(None);
         };
 
