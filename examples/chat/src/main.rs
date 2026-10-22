@@ -96,8 +96,8 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-    let mut receiver = eventbus.consumer(ADDRESS).await?.unwrap();
-    info!("Registered consumer at address '{ADDRESS}'");
+    let mut receiver = eventbus.subscribe(ADDRESS).await?.unwrap();
+    info!("Subscribed to '{ADDRESS}'");
 
     let (mut rl, mut stdout) = Readline::new("> ".to_owned())?;
 

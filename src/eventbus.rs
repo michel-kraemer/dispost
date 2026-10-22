@@ -79,8 +79,8 @@ impl EventBusConfigBuilder {
 pub struct EventBus<'c> {
     endpoint: Endpoint,
     peer: Peer,
-    local_consumers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
-    remote_consumers: DMultiMap<'c, String, Peer>,
+    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
+    remote_subscribers: DMultiMap<'c, String, Peer>,
 }
 
 impl<'c> EventBus<'c> {
@@ -91,11 +91,11 @@ impl<'c> EventBus<'c> {
         let local_addr = endpoint.local_addr().map_err(CreateError::CreateEndpoint)?;
         let public_addr = config.public_addr.unwrap_or(local_addr);
 
-        let local_consumers = Arc::new(DashMap::new());
+        let local_subscribers = Arc::new(DashMap::new());
 
         // handle incoming messages
         let inner_endpoint = endpoint.clone();
-        let inner_local_consumers = Arc::clone(&local_consumers);
+        let inner_local_subscribers = Arc::clone(&local_subscribers);
         tokio::spawn(async move {
             while let Some(conn) = inner_endpoint.accept().await {
                 if !conn.remote_address_validated() {
@@ -103,7 +103,7 @@ impl<'c> EventBus<'c> {
                     conn.retry().unwrap();
                 } else {
                     info!("accepting connection");
-                    let fut = handle_connection(conn, Arc::clone(&inner_local_consumers));
+                    let fut = handle_connection(conn, Arc::clone(&inner_local_subscribers));
                     tokio::spawn(async move {
                         if let Err(e) = fut.await {
                             error!("connection failed: {e}");
@@ -118,30 +118,30 @@ impl<'c> EventBus<'c> {
         Ok(Self {
             endpoint,
             peer: Peer::new(public_addr, config.public_server_name),
-            local_consumers,
-            remote_consumers: cluster.get_multi_map("__disact_consumers"),
+            local_subscribers,
+            remote_subscribers: cluster.get_multi_map("__disact_subscribers"),
         })
     }
 
-    pub async fn consumer<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
+    pub async fn subscribe<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
     where
         A: Into<String>,
     {
         let address: String = address.into();
 
         let (sender, receiver) = unbounded_channel();
-        let mut entry = self.local_consumers.entry(address.clone()).or_default();
+        let mut entry = self.local_subscribers.entry(address.clone()).or_default();
         entry.push(sender);
 
         let inserted = self
-            .remote_consumers
+            .remote_subscribers
             .insert(address, self.peer.clone())
             .await?;
 
         if !inserted {
-            // undo push into local_consumers map - pop() is possible because
+            // undo push into local_subscribers map - pop() is possible because
             // `entry` holds a lock internally and nobody else could have
-            // modified local_consumers in the meantime
+            // modified local_subscribers in the meantime
             entry.pop();
 
             Ok(None)
@@ -182,17 +182,17 @@ impl<'c> EventBus<'c> {
 
     pub async fn send(&self, address: &str, message: &[u8]) -> Result<()> {
         // TODO implement round-robin or some other strategy
-        if let Some(c) = self.remote_consumers.get(address).await?.first() {
-            self.send_to(c, address, message).await
+        if let Some(s) = self.remote_subscribers.get(address).await?.first() {
+            self.send_to(s, address, message).await
         } else {
             Ok(())
         }
     }
 
     pub async fn publish(&self, address: &str, message: &[u8]) -> Result<()> {
-        let consumers = self.remote_consumers.get(address).await?;
-        for c in consumers {
-            self.send_to(&c, address, message).await?;
+        let subscribers = self.remote_subscribers.get(address).await?;
+        for s in subscribers {
+            self.send_to(&s, address, message).await?;
         }
         Ok(())
     }
@@ -243,7 +243,7 @@ fn create_endpoint(
 
 async fn handle_connection(
     conn: Incoming,
-    local_consumers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
+    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
 ) -> Result<()> {
     let connection = conn.await.map_err(TransportError::from)?;
 
@@ -268,7 +268,7 @@ async fn handle_connection(
                 Ok(s) => s,
             };
 
-            let fut = handle_message(stream, Arc::clone(&local_consumers));
+            let fut = handle_message(stream, Arc::clone(&local_subscribers));
             tokio::spawn(
                 async move {
                     if let Err(e) = fut.await {
@@ -286,7 +286,7 @@ async fn handle_connection(
 
 async fn handle_message(
     mut stream: RecvStream,
-    local_consumers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
+    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut msg = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -296,9 +296,9 @@ async fn handle_message(
 
     let msg: Arc<Message> = Arc::new(postcard::from_bytes(&msg)?);
 
-    if let Some(consumers) = local_consumers.get(&msg.address) {
-        for c in consumers.iter() {
-            c.send(Arc::clone(&msg))?;
+    if let Some(subscribers) = local_subscribers.get(&msg.address) {
+        for s in subscribers.iter() {
+            s.send(Arc::clone(&msg))?;
         }
     }
 
