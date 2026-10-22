@@ -14,7 +14,10 @@ use quinn::{
         pki_types::{CertificateDer, PrivateKeyDer},
     },
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    oneshot,
+};
 use tracing::{Instrument, info_span};
 
 use crate::{
@@ -76,26 +79,35 @@ impl EventBusConfigBuilder {
     }
 }
 
-pub struct EventBus<'c> {
-    endpoint: Endpoint,
-    peer: Peer,
-    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
-    remote_subscribers: DMultiMap<'c, String, Peer>,
+enum Subscriber {
+    Unbounded(UnboundedSender<Arc<Message>>),
+    Once(String, oneshot::Sender<Arc<Message>>),
 }
 
-impl<'c> EventBus<'c> {
-    pub fn new(cluster: &'c Cluster, config: EventBusConfig) -> Result<Self, CreateError> {
+pub struct EventBus {
+    endpoint: Endpoint,
+    peer: Peer,
+    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
+    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+}
+
+impl EventBus {
+    pub fn new(cluster: &Cluster, config: EventBusConfig) -> Result<Self, CreateError> {
         // create endpoint
         let endpoint = create_endpoint(config.bind_addr, config.certs, config.key)?;
 
         let local_addr = endpoint.local_addr().map_err(CreateError::CreateEndpoint)?;
         let public_addr = config.public_addr.unwrap_or(local_addr);
 
+        let peer = Peer::new(public_addr, config.public_server_name);
         let local_subscribers = Arc::new(DashMap::new());
+        let remote_subscribers = Arc::new(cluster.get_multi_map("__dispost_subscribers"));
 
         // handle incoming messages
         let inner_endpoint = endpoint.clone();
+        let inner_peer = Arc::new(peer.clone());
         let inner_local_subscribers = Arc::clone(&local_subscribers);
+        let inner_remote_subscribers = Arc::clone(&remote_subscribers);
         tokio::spawn(async move {
             while let Some(conn) = inner_endpoint.accept().await {
                 if !conn.remote_address_validated() {
@@ -103,7 +115,12 @@ impl<'c> EventBus<'c> {
                     conn.retry().unwrap();
                 } else {
                     info!("accepting connection");
-                    let fut = handle_connection(conn, Arc::clone(&inner_local_subscribers));
+                    let fut = handle_connection(
+                        conn,
+                        Arc::clone(&inner_local_subscribers),
+                        Arc::clone(&inner_remote_subscribers),
+                        Arc::clone(&inner_peer),
+                    );
                     tokio::spawn(async move {
                         if let Err(e) = fut.await {
                             error!("connection failed: {e}");
@@ -117,21 +134,25 @@ impl<'c> EventBus<'c> {
 
         Ok(Self {
             endpoint,
-            peer: Peer::new(public_addr, config.public_server_name),
+            peer,
             local_subscribers,
-            remote_subscribers: cluster.get_multi_map("__disact_subscribers"),
+            remote_subscribers,
         })
     }
 
-    pub async fn subscribe<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
+    async fn subscribe_internal<A, R>(
+        &self,
+        address: A,
+        subscriber: Subscriber,
+        receiver: R,
+    ) -> Result<Option<R>>
     where
         A: Into<String>,
     {
         let address: String = address.into();
 
-        let (sender, receiver) = unbounded_channel();
         let mut entry = self.local_subscribers.entry(address.clone()).or_default();
-        entry.push(sender);
+        entry.push(subscriber);
 
         let inserted = self
             .remote_subscribers
@@ -150,12 +171,30 @@ impl<'c> EventBus<'c> {
         }
     }
 
-    async fn send_to(&self, c: &Peer, address: &str, message: &[u8]) -> Result<()> {
-        let payload = postcard::to_allocvec(&Message {
-            address: address.to_string(),
-            body: message.to_vec(),
-        })
-        .map_err(InternalError::SerializeRequest)?;
+    pub async fn subscribe<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
+    where
+        A: Into<String>,
+    {
+        let (sender, receiver) = unbounded_channel();
+        self.subscribe_internal(address, Subscriber::Unbounded(sender), receiver)
+            .await
+    }
+
+    pub async fn subscribe_once<A>(
+        &self,
+        address: A,
+    ) -> Result<Option<oneshot::Receiver<Arc<Message>>>>
+    where
+        A: Into<String>,
+    {
+        let address: String = address.into();
+        let (sender, receiver) = oneshot::channel();
+        self.subscribe_internal(address.clone(), Subscriber::Once(address, sender), receiver)
+            .await
+    }
+
+    async fn send_to(&self, c: &Peer, message: &Message) -> Result<()> {
+        let payload = postcard::to_allocvec(message).map_err(InternalError::SerializeRequest)?;
 
         // TODO add connection cache
         let connection = self
@@ -181,20 +220,61 @@ impl<'c> EventBus<'c> {
     }
 
     pub async fn send(&self, address: &str, message: &[u8]) -> Result<()> {
+        let message = Message {
+            address: address.to_string(),
+            body: message.to_vec(),
+            reply_address: None,
+        };
+
         // TODO implement round-robin or some other strategy
         if let Some(s) = self.remote_subscribers.get(address).await?.first() {
-            self.send_to(s, address, message).await
+            self.send_to(s, &message).await
         } else {
             Ok(())
         }
     }
 
     pub async fn publish(&self, address: &str, message: &[u8]) -> Result<()> {
+        let message = Message {
+            address: address.to_string(),
+            body: message.to_vec(),
+            reply_address: None,
+        };
+
         let subscribers = self.remote_subscribers.get(address).await?;
         for s in subscribers {
-            self.send_to(&s, address, message).await?;
+            self.send_to(&s, &message).await?;
         }
+
         Ok(())
+    }
+
+    pub async fn request(
+        &self,
+        address: &str,
+        message: &[u8],
+    ) -> Result<Option<oneshot::Receiver<Arc<Message>>>> {
+        // TODO implement round-robin or some other strategy
+        let ss = self.remote_subscribers.get(address).await?;
+        let Some(remote_subscriber) = ss.first() else {
+            return Ok(None);
+        };
+
+        let (reply_address, reply) = loop {
+            let reply_address = format!("__dispost_reply_{}", ulid::Ulid::generate());
+            if let Some(reply) = self.subscribe_once(&reply_address).await? {
+                break (reply_address, reply);
+            }
+        };
+
+        let message = Message {
+            address: address.to_string(),
+            body: message.to_vec(),
+            reply_address: Some(reply_address),
+        };
+
+        self.send_to(remote_subscriber, &message).await?;
+        Ok(Some(reply))
     }
 }
 
@@ -243,7 +323,9 @@ fn create_endpoint(
 
 async fn handle_connection(
     conn: Incoming,
-    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
+    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
+    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    peer: Arc<Peer>,
 ) -> Result<()> {
     let connection = conn.await.map_err(TransportError::from)?;
 
@@ -268,12 +350,12 @@ async fn handle_connection(
                 Ok(s) => s,
             };
 
-            let fut = handle_message(stream, Arc::clone(&local_subscribers));
+            let local_subscribers = Arc::clone(&local_subscribers);
+            let remote_subscribers = Arc::clone(&remote_subscribers);
+            let peer = Arc::clone(&peer);
             tokio::spawn(
                 async move {
-                    if let Err(e) = fut.await {
-                        error!("failed to handle incoming message: {e}");
-                    }
+                    handle_message(stream, local_subscribers, remote_subscribers, peer).await;
                 }
                 .instrument(info_span!("handle_message")),
             );
@@ -286,21 +368,58 @@ async fn handle_connection(
 
 async fn handle_message(
     mut stream: RecvStream,
-    local_subscribers: Arc<DashMap<String, Vec<UnboundedSender<Arc<Message>>>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
+    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    peer: Arc<Peer>,
+) {
     let mut msg = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
-    while let Some(read) = stream.read(&mut buf).await? {
-        msg.extend(&buf[0..read]);
-    }
-
-    let msg: Arc<Message> = Arc::new(postcard::from_bytes(&msg)?);
-
-    if let Some(subscribers) = local_subscribers.get(&msg.address) {
-        for s in subscribers.iter() {
-            s.send(Arc::clone(&msg))?;
+    loop {
+        let read = stream.read(&mut buf).await;
+        match read {
+            Ok(Some(read)) => msg.extend(&buf[0..read]),
+            Ok(None) => break,
+            Err(e) => {
+                error!("failed to read incoming message: {e}");
+                return;
+            }
         }
     }
 
-    Ok(())
+    let msg = match postcard::from_bytes::<Message>(&msg) {
+        Ok(msg) => Arc::new(msg),
+        Err(e) => {
+            error!("failed to deserialize incoming message: {e}");
+            return;
+        }
+    };
+
+    if let Some(mut subscribers) = local_subscribers.get_mut(&msg.address) {
+        let oneshot_subscribers = subscribers.extract_if(.., |s| matches!(s, Subscriber::Once(..)));
+
+        for s in oneshot_subscribers {
+            match s {
+                Subscriber::Once(address, sender) => {
+                    if sender.send(Arc::clone(&msg)).is_err() {
+                        error!("failed to forward incoming message to local oneshot subscriber");
+                    }
+                    if let Err(e) = remote_subscribers.remove(&address, &peer).await {
+                        error!("failed to unsubscribe oneshot subscriber: {e}");
+                    }
+                }
+                _ => unreachable!("collection only contains oneshot subscribers"),
+            }
+        }
+
+        for s in subscribers.iter() {
+            match s {
+                Subscriber::Unbounded(sender) => {
+                    if let Err(e) = sender.send(Arc::clone(&msg)) {
+                        error!("failed to forward incoming message to local subscriber: {e}");
+                    }
+                }
+                Subscriber::Once(..) => unreachable!("already removed above"),
+            }
+        }
+    }
 }

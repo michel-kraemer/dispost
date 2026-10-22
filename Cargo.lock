@@ -445,12 +445,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "ulid",
 ]
 
 [[package]]
 name = "distruct"
 version = "0.1.0"
-source = "git+https://github.com/michel-kraemer/distruct#ae8a40ef18ac2e1115478083c53bceca3cf3501d"
+source = "git+https://github.com/michel-kraemer/distruct#6260391db3aaf9e682cdcd44853db96536b33ce3"
 dependencies = [
  "dashmap",
  "log",
