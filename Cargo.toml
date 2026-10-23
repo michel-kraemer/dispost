@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/michel-kraemer/dispost"
-keywords = ["event bus", "raft", "consistency", "cluster", "distributed"]
+keywords = ["event-bus", "raft", "consistency", "cluster", "distributed"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
