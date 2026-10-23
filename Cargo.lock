@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "dispost"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dashmap",
  "distruct",
@@ -450,9 +450,9 @@ dependencies = [
 
 [[package]]
 name = "distruct"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb140a1150213a5b0689f42dd7d5c15da1c59b4190337477e64fd153f5034770"
+checksum = "8a4c786afb550acfe04c4f127dd6a075a68657d626189bca624d7855e30a8730"
 dependencies = [
  "dashmap",
  "log",
