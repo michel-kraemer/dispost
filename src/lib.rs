@@ -69,7 +69,7 @@
 //!
 //! ```no_run
 //! # async fn send(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! eventbus.publish("my_address", b"Hello world").await?;
+//! eventbus.send("my_address", b"Hello world").await?;
 //! # Ok(())
 //! # }
 //! ```
