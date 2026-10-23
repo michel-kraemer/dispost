@@ -1,6 +1,6 @@
 [package]
 name = "chat"
-description = "Event bus based on strongly-consistent distributed data structures"
+description = "An event bus based on strongly consistent distributed data structures"
 version = "0.1.0"
 edition = "2024"
 publish = false

@@ -22,13 +22,16 @@ use tokio::sync::{
 use tracing::{Instrument, info_span};
 
 use crate::{
-    error::{ConfigError, CreateError, InternalError, Result, TransportError},
+    error::{ConfigError, CreateError, Result, TransportError},
     message::Message,
     peer::Peer,
 };
 
 const ALPN_QUIC_EVENTBUS: &[u8] = b"eventbus";
 
+/// [`EventBus`] configuration.
+///
+/// Create instances using [`EventBusConfigBuilder`].
 pub struct EventBusConfig {
     bind_addr: SocketAddr,
     public_addr: Option<SocketAddr>,
@@ -37,6 +40,7 @@ pub struct EventBusConfig {
     key: PrivateKeyDer<'static>,
 }
 
+/// A builder for [`EventBusConfig`].
 pub struct EventBusConfigBuilder {
     bind_addr: SocketAddr,
     public_addr: Option<SocketAddr>,
@@ -54,17 +58,30 @@ impl Default for EventBusConfigBuilder {
 }
 
 impl EventBusConfigBuilder {
+    /// Sets the IP address and port to bind the node to.
+    ///
+    /// By default, the node binds to the loopback address (`::1`) on a random
+    /// port.
     pub fn with_bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = addr;
         self
     }
 
-    pub fn with_public_addr(mut self, addr: SocketAddr, server_name: String) -> Self {
+    /// Sets the public IP address and port that other nodes can use to reach
+    /// this node.
+    ///
+    /// If not set, the public address defaults to the bind address.
+    pub fn with_public_addr<S>(mut self, addr: SocketAddr, server_name: S) -> Self
+    where
+        S: Into<String>,
+    {
         self.public_addr = Some(addr);
-        self.public_server_name = server_name;
+        self.public_server_name = server_name.into();
         self
     }
 
+    /// Builds the [`EventBusConfig`] object using the current builder
+    /// configuration and the given TLS certificates and private key.
     pub fn build(
         self,
         certs: Vec<CertificateDer<'static>>,
@@ -85,6 +102,9 @@ enum Subscriber {
     Once(String, oneshot::Sender<Arc<Message>>),
 }
 
+/// A distributed event bus.
+///
+/// Use it to send messages between nodes in a `distruct::Cluster`.
 pub struct EventBus {
     endpoint: Endpoint,
     peer: Peer,
@@ -93,6 +113,8 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    /// Creates a new event bus using the given `distruct::Cluster` and
+    /// configuration.
     pub fn new(cluster: &Cluster, config: EventBusConfig) -> Result<Self, CreateError> {
         // create endpoint
         let endpoint = create_endpoint(config.bind_addr, config.certs, config.key)?;
@@ -172,6 +194,14 @@ impl EventBus {
         }
     }
 
+    /// Subscribe to an address on the event bus.
+    ///
+    /// The method creates an unbounded in-memory message queue for messages
+    /// that arrive at the given address. It returns a receiver that can be used
+    /// to take messages from the queue.
+    ///
+    /// If the current cluster node already listens to the given address, the
+    /// method returns `None`.
     pub async fn subscribe<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
     where
         A: Into<String>,
@@ -181,6 +211,14 @@ impl EventBus {
             .await
     }
 
+    /// Subscribe to receiving a single message at a certain event bus address.
+    ///
+    /// The method creates a one-shot receiver that can be used to receive
+    /// exactly one message at the given address. Once the message is received,
+    /// the receiver cannot be used anymore.
+    ///
+    /// If the current cluster node already listens to the given address, the
+    /// method returns `None`.
     pub async fn subscribe_once<A>(
         &self,
         address: A,
@@ -195,7 +233,7 @@ impl EventBus {
     }
 
     async fn send_to(&self, c: &Peer, message: &Message) -> Result<()> {
-        let payload = postcard::to_allocvec(message).map_err(InternalError::SerializeRequest)?;
+        let payload = postcard::to_allocvec(message)?;
 
         // TODO add connection cache
         let connection = self
@@ -220,6 +258,14 @@ impl EventBus {
         Ok(())
     }
 
+    /// Send a message to a single subscriber at a certain event bus address.
+    ///
+    /// If there is no subscriber at the given address, the method is a no-op.
+    /// If there are multiple subscribers, the current implementation selects one
+    /// at random. This may change in the future.
+    ///
+    /// The method makes no guarantees about whether the message is actually
+    /// received and processed by the subscriber.
     pub async fn send(&self, address: &str, message: &[u8]) -> Result<()> {
         let message = Message {
             address: address.to_string(),
@@ -240,6 +286,12 @@ impl EventBus {
         }
     }
 
+    /// Send a message to all subscribers at a certain event bus address.
+    ///
+    /// If there is no subscriber at the given address, the method is a no-op.
+    ///
+    /// The method makes no guarantees about whether the message is actually
+    /// received and processed by the subscribers.
     pub async fn publish(&self, address: &str, message: &[u8]) -> Result<()> {
         let message = Message {
             address: address.to_string(),
@@ -255,6 +307,16 @@ impl EventBus {
         Ok(())
     }
 
+    /// Send a request to a subscriber at a certain event bus address and return
+    /// its reply.
+    ///
+    /// If there is no subscriber at the given address, the method returns
+    /// `None`. Otherwise, the method sends the message to exactly one
+    /// subscriber and returns a one-shot receiver that can be used to receive
+    /// the subscriber's reply.
+    ///
+    /// If there are multiple subscribers, the current implementation selects one
+    /// at random. This may change in the future.
     pub async fn request(
         &self,
         address: &str,
