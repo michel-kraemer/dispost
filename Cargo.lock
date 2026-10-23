@@ -215,7 +215,6 @@ dependencies = [
  "anyhow",
  "clap",
  "dispost",
- "distruct",
  "log",
  "rustyline-async",
  "tokio",
@@ -452,7 +451,8 @@ dependencies = [
 [[package]]
 name = "distruct"
 version = "0.1.0"
-source = "git+https://github.com/michel-kraemer/distruct#6260391db3aaf9e682cdcd44853db96536b33ce3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb140a1150213a5b0689f42dd7d5c15da1c59b4190337477e64fd153f5034770"
 dependencies = [
  "dashmap",
  "log",

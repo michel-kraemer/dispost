@@ -5,3 +5,5 @@ mod peer;
 
 pub use eventbus::{EventBus, EventBusConfig, EventBusConfigBuilder};
 pub use message::Message;
+
+pub use distruct;

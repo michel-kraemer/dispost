@@ -5,11 +5,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use dispost::{EventBus, EventBusConfigBuilder};
-use distruct::{
+use dispost::distruct::{
     Cluster, ClusterConfigBuilder,
     rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
+use dispost::{EventBus, EventBusConfigBuilder};
 use log::info;
 use rustyline_async::{Readline, ReadlineEvent};
 use tokio::{select, sync::oneshot};
