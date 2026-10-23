@@ -3,6 +3,10 @@ name = "dispost"
 description = "Event bus based on strongly-consistent distributed data structures"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/michel-kraemer/dispost"
+keywords = ["event bus", "raft", "consistency", "cluster", "distributed"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 dashmap = "6.2.1"
