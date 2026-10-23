@@ -1,3 +1,5 @@
+# Chat example
+
 ## How to run
 
 1. Create a certificate chain and a private key for testing:
