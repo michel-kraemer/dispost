@@ -776,4 +776,89 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn subscribe_once_send() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let receiver = eventbus.subscribe_once("my_address").await?;
+        let handle = tokio::spawn(receiver);
+
+        eventbus.send("my_address", b"hello").await?;
+
+        let msg = handle.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg.body);
+
+        // subscriber should not be there anymore
+        let Err(Error::NoSubscriber { address }) = eventbus.send("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_once_publish() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let receiver = eventbus.subscribe_once("my_address").await?;
+        let handle = tokio::spawn(receiver);
+
+        eventbus.publish("my_address", b"hello").await?;
+
+        let msg = handle.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg.body);
+
+        // subscriber should not be there anymore
+        let Err(Error::NoSubscriber { address }) = eventbus.publish("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_once_request() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+        let eventbus = Arc::new(eventbus);
+
+        let receiver = eventbus.subscribe_once("my_address").await?;
+        let inner_eventbus = Arc::clone(&eventbus);
+        let handle = tokio::spawn(async move {
+            let msg = receiver.await.context("no message received")?;
+            let reply = msg.body.to_ascii_uppercase();
+            let reply_address = msg.reply_address.as_ref().context("no reply address")?;
+            inner_eventbus.send(reply_address, &reply).await?;
+            anyhow::Ok(())
+        });
+
+        let reply_receiver = eventbus.request("my_address", b"hello").await?;
+
+        handle.await??;
+
+        let reply = reply_receiver.await?;
+        assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
+
+        // subscriber should not be there anymore
+        let Err(Error::NoSubscriber { address }) = eventbus.request("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        Arc::into_inner(eventbus).unwrap().shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
 }
