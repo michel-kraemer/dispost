@@ -123,6 +123,18 @@
 //! If there are multiple subscribers listening on the same address, the current
 //! implementation selects one at random. This behavior may change in the
 //! future.
+//!
+//! # Gracefully shutting down the event bus
+//!
+//! Use [`EventBus::shutdown`] to shut down the event bus and to unregister all
+//! subscribers.
+//!
+//! ```no_run
+//! # async fn shut(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
+//! eventbus.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
 pub mod error;
 mod eventbus;
 mod message;
