@@ -25,7 +25,7 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use crate::{
-    error::{ConfigError, CreateError, Result, ShutdownEventBusError, TransportError},
+    error::{ConfigError, CreateError, Error, Result, ShutdownEventBusError, TransportError},
     message::Message,
     peer::Peer,
 };
@@ -176,12 +176,7 @@ impl EventBus {
         Ok(())
     }
 
-    async fn subscribe_internal<A, R>(
-        &self,
-        address: A,
-        subscriber: Subscriber,
-        receiver: R,
-    ) -> Result<Option<R>>
+    async fn subscribe_internal<A>(&self, address: A, subscriber: Subscriber) -> Result<()>
     where
         A: Into<String>,
     {
@@ -190,21 +185,11 @@ impl EventBus {
         let mut entry = self.local_subscribers.entry(address.clone()).or_default();
         entry.push(subscriber);
 
-        let inserted = self
-            .remote_subscribers
+        self.remote_subscribers
             .insert(address, self.peer.clone())
             .await?;
 
-        if !inserted {
-            // undo push into local_subscribers map - pop() is possible because
-            // `entry` holds a lock internally and nobody else could have
-            // modified local_subscribers in the meantime
-            entry.pop();
-
-            Ok(None)
-        } else {
-            Ok(Some(receiver))
-        }
+        Ok(())
     }
 
     /// Subscribe to an address on the event bus.
@@ -215,13 +200,14 @@ impl EventBus {
     ///
     /// If the current cluster node already listens to the given address, the
     /// method returns `None`.
-    pub async fn subscribe<A>(&self, address: A) -> Result<Option<UnboundedReceiver<Arc<Message>>>>
+    pub async fn subscribe<A>(&self, address: A) -> Result<UnboundedReceiver<Arc<Message>>>
     where
         A: Into<String>,
     {
         let (sender, receiver) = unbounded_channel();
-        self.subscribe_internal(address, Subscriber::Unbounded(sender), receiver)
-            .await
+        self.subscribe_internal(address, Subscriber::Unbounded(sender))
+            .await?;
+        Ok(receiver)
     }
 
     /// Subscribe to receiving a single message at a certain event bus address.
@@ -232,17 +218,15 @@ impl EventBus {
     ///
     /// If the current cluster node already listens to the given address, the
     /// method returns `None`.
-    pub async fn subscribe_once<A>(
-        &self,
-        address: A,
-    ) -> Result<Option<oneshot::Receiver<Arc<Message>>>>
+    pub async fn subscribe_once<A>(&self, address: A) -> Result<oneshot::Receiver<Arc<Message>>>
     where
         A: Into<String>,
     {
         let address: String = address.into();
         let (sender, receiver) = oneshot::channel();
-        self.subscribe_internal(address.clone(), Subscriber::Once(address, sender), receiver)
-            .await
+        self.subscribe_internal(address.clone(), Subscriber::Once(address, sender))
+            .await?;
+        Ok(receiver)
     }
 
     async fn send_to(&self, c: &Peer, message: &Message) -> Result<()> {
@@ -273,9 +257,9 @@ impl EventBus {
 
     /// Send a message to a single subscriber at a certain event bus address.
     ///
-    /// If there is no subscriber at the given address, the method is a no-op.
-    /// If there are multiple subscribers, the current implementation selects one
-    /// at random. This may change in the future.
+    /// If there is no subscriber at the given address, the method returns
+    /// [`Error::NoSubscriber`]. If there are multiple subscribers, the current
+    /// implementation selects one at random. This may change in the future.
     ///
     /// The method makes no guarantees about whether the message is actually
     /// received and processed by the subscriber.
@@ -296,13 +280,16 @@ impl EventBus {
         if let Some(s) = peer {
             self.send_to(s, &message).await
         } else {
-            Ok(())
+            Err(Error::NoSubscriber {
+                address: address.to_string(),
+            })
         }
     }
 
     /// Send a message to all subscribers at a certain event bus address.
     ///
-    /// If there is no subscriber at the given address, the method is a no-op.
+    /// If there is no subscriber at the given address at all, the method
+    /// returns [`Error::NoSubscriber`].
     ///
     /// The method makes no guarantees about whether the message is actually
     /// received and processed by the subscribers.
@@ -314,6 +301,13 @@ impl EventBus {
         };
 
         let subscribers = self.remote_subscribers.get(address).await?;
+
+        if subscribers.is_empty() {
+            return Err(Error::NoSubscriber {
+                address: address.to_string(),
+            });
+        }
+
         for s in subscribers {
             self.send_to(&s, &message).await?;
         }
@@ -325,29 +319,27 @@ impl EventBus {
     /// its reply.
     ///
     /// If there is no subscriber at the given address, the method returns
-    /// `None`. Otherwise, the method sends the message to exactly one
-    /// subscriber and returns a one-shot receiver that can be used to receive
-    /// the subscriber's reply.
+    /// [`Error::NoSubscriber`]. Otherwise, the method sends the message to
+    /// exactly one subscriber and returns a one-shot receiver that can be used
+    /// to receive the subscriber's reply.
     ///
-    /// If there are multiple subscribers, the current implementation selects one
-    /// at random. This may change in the future.
+    /// If there are multiple subscribers, the current implementation selects
+    /// one at random. This may change in the future.
     pub async fn request(
         &self,
         address: &str,
         message: &[u8],
-    ) -> Result<Option<oneshot::Receiver<Arc<Message>>>> {
+    ) -> Result<oneshot::Receiver<Arc<Message>>> {
         // TODO implement proper round-robin and other strategies
         let ss = self.remote_subscribers.get(address).await?;
         let Some(remote_subscriber) = ss.choose(&mut rand::rng()) else {
-            return Ok(None);
+            return Err(Error::NoSubscriber {
+                address: address.to_string(),
+            });
         };
 
-        let (reply_address, reply) = loop {
-            let reply_address = format!("__dispost_reply_{}", ulid::Ulid::generate());
-            if let Some(reply) = self.subscribe_once(&reply_address).await? {
-                break (reply_address, reply);
-            }
-        };
+        let reply_address = format!("__dispost_reply_{}", ulid::Ulid::generate());
+        let reply_receiver = self.subscribe_once(&reply_address).await?;
 
         let message = Message {
             address: address.to_string(),
@@ -358,7 +350,7 @@ impl EventBus {
         // TODO unsubscribe if send fails!
         self.send_to(remote_subscriber, &message).await?;
 
-        Ok(Some(reply))
+        Ok(reply_receiver)
     }
 }
 
@@ -512,13 +504,13 @@ async fn handle_message(
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use anyhow::{Context as _, Result};
+    use anyhow::{Context as _, Result, bail};
     use distruct::{Cluster, ClusterConfigBuilder};
     use quinn::rustls::pki_types::PrivateKeyDer;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::{select, time::timeout};
 
-    use crate::{EventBus, EventBusConfigBuilder};
+    use crate::{EventBus, EventBusConfigBuilder, error::Error};
 
     async fn setup_single_node() -> Result<(Cluster, EventBus)> {
         let CertifiedKey { cert, signing_key } =
@@ -562,10 +554,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_no_subscriber() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let Err(Error::NoSubscriber { address }) = eventbus.send("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn send_single_node() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
 
-        let mut receiver = eventbus.subscribe("my_address").await?.unwrap();
+        let mut receiver = eventbus.subscribe("my_address").await?;
         let handle = tokio::spawn(async move { receiver.recv().await });
 
         eventbus.send("my_address", b"hello").await?;
@@ -583,7 +591,7 @@ mod tests {
     async fn send_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver = eventbus2.subscribe("my_address").await?.unwrap();
+        let mut receiver = eventbus2.subscribe("my_address").await?;
         let handle = tokio::spawn(async move { receiver.recv().await });
 
         eventbus1.send("my_address", b"hello").await?;
@@ -603,8 +611,8 @@ mod tests {
     async fn send_multiple_receivers() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver1 = eventbus1.subscribe("my_address").await?.unwrap();
-        let mut receiver2 = eventbus2.subscribe("my_address").await?.unwrap();
+        let mut receiver1 = eventbus1.subscribe("my_address").await?;
+        let mut receiver2 = eventbus2.subscribe("my_address").await?;
 
         eventbus1.send("my_address", b"hello").await?;
 
@@ -636,11 +644,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_no_subscriber() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let Err(Error::NoSubscriber { address }) = eventbus.publish("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_single_node() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let mut receiver1 = eventbus.subscribe("my_address").await?;
+        let mut receiver2 = eventbus.subscribe("my_address").await?;
+        let handle1 = tokio::spawn(async move { receiver1.recv().await });
+        let handle2 = tokio::spawn(async move { receiver2.recv().await });
+
+        eventbus.publish("my_address", b"hello").await?;
+
+        let msg1 = handle1.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg1.body);
+        let msg2 = handle2.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg2.body);
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn publish_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver1 = eventbus1.subscribe("my_address").await?.unwrap();
-        let mut receiver2 = eventbus2.subscribe("my_address").await?.unwrap();
+        let mut receiver1 = eventbus1.subscribe("my_address").await?;
+        let mut receiver2 = eventbus2.subscribe("my_address").await?;
         let handle1 = tokio::spawn(async move { receiver1.recv().await });
         let handle2 = tokio::spawn(async move { receiver2.recv().await });
 
@@ -660,12 +706,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_no_subscriber() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let Err(Error::NoSubscriber { address }) = eventbus.request("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn request_single_node() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
         let eventbus = Arc::new(eventbus);
 
         let inner_eventbus = Arc::clone(&eventbus);
-        let mut receiver = eventbus.subscribe("my_address").await?.unwrap();
+        let mut receiver = eventbus.subscribe("my_address").await?;
         let handle = tokio::spawn(async move {
             let msg = receiver.recv().await.context("no message received")?;
             let reply = msg.body.to_ascii_uppercase();
@@ -674,10 +736,7 @@ mod tests {
             anyhow::Ok(())
         });
 
-        let reply_receiver = eventbus
-            .request("my_address", b"hello")
-            .await?
-            .context("no subscriber registered")?;
+        let reply_receiver = eventbus.request("my_address", b"hello").await?;
 
         handle.await??;
 
@@ -694,7 +753,7 @@ mod tests {
     async fn request_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver = eventbus2.subscribe("my_address").await?.unwrap();
+        let mut receiver = eventbus2.subscribe("my_address").await?;
         let handle = tokio::spawn(async move {
             let msg = receiver.recv().await.context("no message received")?;
             let reply = msg.body.to_ascii_uppercase();
@@ -704,10 +763,7 @@ mod tests {
             anyhow::Ok(())
         });
 
-        let reply_receiver = eventbus1
-            .request("my_address", b"hello")
-            .await?
-            .context("no subscriber registered")?;
+        let reply_receiver = eventbus1.request("my_address", b"hello").await?;
 
         handle.await??;
 

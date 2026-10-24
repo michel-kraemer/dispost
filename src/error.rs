@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("failed to serialize or deserialize value: {0}")]
     Serialization(#[from] postcard::Error),
+
+    #[error("no subscriber for address `{address}'")]
+    NoSubscriber { address: String },
 }
 
 /// An error that can happen when creating an [`EventBus`](crate::EventBus).

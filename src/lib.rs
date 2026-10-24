@@ -51,11 +51,8 @@
 //! bus:
 //!
 //! ```no_run
-//! # async fn receive(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut receiver = eventbus
-//!     .subscribe("my_address")
-//!     .await?
-//!     .expect("this node is already subscribed to 'my_address'");
+//! # async fn recv(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut receiver = eventbus.subscribe("my_address").await?;
 //! while let Some(message) = receiver.recv().await {
 //!     // do something with `message`, for example:
 //!     println!("{}", std::str::from_utf8(&message.body)?);
@@ -100,15 +97,11 @@
 //!
 //! ```no_run
 //! # async fn recv(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut receiver = eventbus
-//!     .subscribe("uppercase")
-//!     .await?
-//!     .expect("this node is already subscribed to 'uppercase'");
+//! let mut receiver = eventbus.subscribe("uppercase").await?;
 //! while let Some(message) = receiver.recv().await {
 //!     if let Some(reply_address) = &message.reply_address {
-//!         let contents = std::str::from_utf8(&message.body)?;
-//!         let reply = contents.to_uppercase();
-//!         eventbus.send(&reply_address, reply.as_bytes()).await?;
+//!         let reply = message.body.to_ascii_uppercase();
+//!         eventbus.send(&reply_address, &reply).await?;
 //!     }
 //! }
 //! # Ok(())
@@ -120,10 +113,7 @@
 //!
 //! ```no_run
 //! # async fn req(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let receiver = eventbus
-//!     .request("uppercase", b"Hello world")
-//!     .await?
-//!     .expect("there is no subscriber listening on 'uppercase'");
+//! let receiver = eventbus.request("uppercase", b"Hello world").await?;
 //! let reply = receiver.await?;
 //! assert_eq!("HELLO WORLD", std::str::from_utf8(&reply.body)?);
 //! # Ok(())
