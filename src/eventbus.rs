@@ -507,3 +507,217 @@ async fn handle_message(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use anyhow::{Context as _, Result};
+    use distruct::{Cluster, ClusterConfigBuilder};
+    use quinn::rustls::pki_types::PrivateKeyDer;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use tokio::{select, time::timeout};
+
+    use crate::{EventBus, EventBusConfigBuilder};
+
+    async fn setup_single_node() -> Result<(Cluster, EventBus)> {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string(), "::1".to_string()]).unwrap();
+        let certs = vec![cert.der().clone()];
+        let key: PrivateKeyDer<'_> = signing_key.into();
+
+        let cluster =
+            Cluster::spawn(ClusterConfigBuilder::default().build(certs.clone(), key.clone_key()))
+                .await?;
+        let eventbus = EventBus::new(&cluster, EventBusConfigBuilder::default().build(certs, key))?;
+
+        Ok((cluster, eventbus))
+    }
+
+    async fn setup_two_nodes() -> Result<((Cluster, EventBus), (Cluster, EventBus))> {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string(), "::1".to_string()]).unwrap();
+        let certs = vec![cert.der().clone()];
+        let key: PrivateKeyDer<'_> = signing_key.into();
+
+        let cluster1 =
+            Cluster::spawn(ClusterConfigBuilder::default().build(certs.clone(), key.clone_key()))
+                .await?;
+        let cluster2 = Cluster::spawn(
+            ClusterConfigBuilder::default()
+                .with_seed(cluster1.public_addr(), "localhost")
+                .build(certs.clone(), key.clone_key()),
+        )
+        .await?;
+        let eventbus1 = EventBus::new(
+            &cluster1,
+            EventBusConfigBuilder::default().build(certs.clone(), key.clone_key()),
+        )?;
+        let eventbus2 = EventBus::new(
+            &cluster2,
+            EventBusConfigBuilder::default().build(certs, key),
+        )?;
+
+        Ok(((cluster1, eventbus1), (cluster2, eventbus2)))
+    }
+
+    #[tokio::test]
+    async fn send_single_node() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let mut receiver = eventbus.subscribe("my_address").await?.unwrap();
+        let handle = tokio::spawn(async move { receiver.recv().await });
+
+        eventbus.send("my_address", b"hello").await?;
+
+        let msg = handle.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg.body);
+
+        eventbus.shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_two_nodes() -> Result<()> {
+        let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
+
+        let mut receiver = eventbus2.subscribe("my_address").await?.unwrap();
+        let handle = tokio::spawn(async move { receiver.recv().await });
+
+        eventbus1.send("my_address", b"hello").await?;
+
+        let msg = handle.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg.body);
+
+        eventbus1.shutdown().await?;
+        eventbus2.shutdown().await?;
+        cluster1.shutdown().await?;
+        cluster2.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_multiple_receivers() -> Result<()> {
+        let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
+
+        let mut receiver1 = eventbus1.subscribe("my_address").await?.unwrap();
+        let mut receiver2 = eventbus2.subscribe("my_address").await?.unwrap();
+
+        eventbus1.send("my_address", b"hello").await?;
+
+        let (mut other, msg) = timeout(Duration::from_secs(5), async {
+            select! {
+                m = receiver1.recv() => (receiver2, m),
+                m = receiver2.recv() => (receiver1, m),
+            }
+        })
+        .await
+        .context("no message received")?;
+
+        let msg = msg.context("channel closed")?;
+        assert_eq!(b"hello".to_vec(), msg.body);
+
+        assert!(
+            timeout(Duration::from_millis(200), other.recv())
+                .await
+                .is_err(),
+            "message was delivered to both subscribers"
+        );
+
+        eventbus1.shutdown().await?;
+        eventbus2.shutdown().await?;
+        cluster1.shutdown().await?;
+        cluster2.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_two_nodes() -> Result<()> {
+        let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
+
+        let mut receiver1 = eventbus1.subscribe("my_address").await?.unwrap();
+        let mut receiver2 = eventbus2.subscribe("my_address").await?.unwrap();
+        let handle1 = tokio::spawn(async move { receiver1.recv().await });
+        let handle2 = tokio::spawn(async move { receiver2.recv().await });
+
+        eventbus1.publish("my_address", b"hello").await?;
+
+        let msg1 = handle1.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg1.body);
+        let msg2 = handle2.await?.context("no message received")?;
+        assert_eq!("hello".as_bytes().to_vec(), msg2.body);
+
+        eventbus1.shutdown().await?;
+        eventbus2.shutdown().await?;
+        cluster1.shutdown().await?;
+        cluster2.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_single_node() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+        let eventbus = Arc::new(eventbus);
+
+        let inner_eventbus = Arc::clone(&eventbus);
+        let mut receiver = eventbus.subscribe("my_address").await?.unwrap();
+        let handle = tokio::spawn(async move {
+            let msg = receiver.recv().await.context("no message received")?;
+            let reply = msg.body.to_ascii_uppercase();
+            let reply_address = msg.reply_address.as_ref().context("no reply address")?;
+            inner_eventbus.send(reply_address, &reply).await?;
+            anyhow::Ok(())
+        });
+
+        let reply_receiver = eventbus
+            .request("my_address", b"hello")
+            .await?
+            .context("no subscriber registered")?;
+
+        handle.await??;
+
+        let reply = reply_receiver.await?;
+        assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
+
+        Arc::into_inner(eventbus).unwrap().shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_two_nodes() -> Result<()> {
+        let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
+
+        let mut receiver = eventbus2.subscribe("my_address").await?.unwrap();
+        let handle = tokio::spawn(async move {
+            let msg = receiver.recv().await.context("no message received")?;
+            let reply = msg.body.to_ascii_uppercase();
+            let reply_address = msg.reply_address.as_ref().context("no reply address")?;
+            eventbus2.send(reply_address, &reply).await?;
+            eventbus2.shutdown().await?;
+            anyhow::Ok(())
+        });
+
+        let reply_receiver = eventbus1
+            .request("my_address", b"hello")
+            .await?
+            .context("no subscriber registered")?;
+
+        handle.await??;
+
+        let reply = reply_receiver.await?;
+        assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
+
+        eventbus1.shutdown().await?;
+        cluster1.shutdown().await?;
+        cluster2.shutdown().await?;
+
+        Ok(())
+    }
+}
