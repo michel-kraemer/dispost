@@ -1,5 +1,6 @@
 //! Error types exposed by this crate.
 use quinn::rustls;
+use tokio::task::JoinError;
 
 /// Alias for a [`core::result::Result`] with the error type
 /// [`dispost::Error`](Error).
@@ -33,6 +34,12 @@ pub enum CreateError {
 
     #[error("failed to create endpoint: {0}")]
     CreateEndpoint(#[source] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShutdownEventBusError {
+    #[error("failed to join asynchronous task: {0}")]
+    Join(#[from] JoinError),
 }
 
 /// An error that can happen when configuring an [`EventBus`](crate::EventBus).

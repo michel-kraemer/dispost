@@ -15,14 +15,17 @@ use quinn::{
     },
 };
 use rand::seq::IndexedRandom as _;
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-    oneshot,
+use tokio::{
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        oneshot,
+    },
+    task::JoinHandle,
 };
 use tracing::{Instrument, info_span};
 
 use crate::{
-    error::{ConfigError, CreateError, Result, TransportError},
+    error::{ConfigError, CreateError, Result, ShutdownEventBusError, TransportError},
     message::Message,
     peer::Peer,
 };
@@ -110,6 +113,7 @@ pub struct EventBus {
     peer: Peer,
     local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
     remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    main_loop_handle: JoinHandle<()>,
 }
 
 impl EventBus {
@@ -131,7 +135,7 @@ impl EventBus {
         let inner_peer = Arc::new(peer.clone());
         let inner_local_subscribers = Arc::clone(&local_subscribers);
         let inner_remote_subscribers = Arc::clone(&remote_subscribers);
-        tokio::spawn(async move {
+        let main_loop_handle = tokio::spawn(async move {
             while let Some(conn) = inner_endpoint.accept().await {
                 if !conn.remote_address_validated() {
                     info!("requiring connection to validate its address");
@@ -160,7 +164,16 @@ impl EventBus {
             peer,
             local_subscribers,
             remote_subscribers,
+            main_loop_handle,
         })
+    }
+
+    /// Shuts down the event bus.
+    pub async fn shutdown(self) -> Result<(), ShutdownEventBusError> {
+        self.endpoint.close(0u32.into(), b"shutdown");
+        self.endpoint.wait_idle().await;
+        self.main_loop_handle.await?;
+        Ok(())
     }
 
     async fn subscribe_internal<A, R>(
