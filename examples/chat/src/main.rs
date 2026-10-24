@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    eventbus.shutdown().await?;
     cluster.shutdown().await?;
 
     Ok(())
