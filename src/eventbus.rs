@@ -17,7 +17,8 @@ use quinn::{
 use rand::seq::IndexedRandom as _;
 use tokio::{
     sync::{
-        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        Mutex,
+        mpsc::{UnboundedSender, unbounded_channel},
         oneshot,
     },
     task::JoinHandle,
@@ -25,9 +26,10 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use crate::{
-    error::{ConfigError, CreateError, Error, Result, ShutdownEventBusError, TransportError},
+    error::{ConfigError, CreateError, Error, Result, TransportError},
     message::Message,
     peer::Peer,
+    subscribers::{OnceSubscriber, UnboundedSubscriber},
 };
 
 const ALPN_QUIC_EVENTBUS: &[u8] = b"eventbus";
@@ -100,9 +102,98 @@ impl EventBusConfigBuilder {
     }
 }
 
-enum Subscriber {
-    Unbounded(UnboundedSender<Arc<Message>>),
-    Once(String, oneshot::Sender<Arc<Message>>),
+enum SubscriberSender {
+    Unbounded {
+        id: u64,
+        sender: UnboundedSender<Arc<Message>>,
+    },
+    Once {
+        id: u64,
+        address: Arc<str>,
+        sender: oneshot::Sender<Arc<Message>>,
+    },
+}
+
+struct SubscriberMaps {
+    /// A Mutex that only needs to be locked on write operations where
+    /// `local_subscribers` and `remote_subscribers` are changed at the same
+    /// time.
+    write_mutex: Mutex<()>,
+
+    local_subscribers: DashMap<Arc<str>, Vec<SubscriberSender>>,
+    remote_subscribers: DMultiMap<Arc<str>, Peer>,
+}
+
+impl SubscriberMaps {
+    async fn add(&self, peer: Peer, address: Arc<str>, sender: SubscriberSender) -> Result<()> {
+        let _lock = self.write_mutex.lock().await;
+
+        let mut entry = self
+            .local_subscribers
+            .entry(Arc::clone(&address))
+            .or_default();
+        entry.push(sender);
+
+        if let Err(e) = self.remote_subscribers.insert(address, peer).await {
+            // make sure `entry` does not contain an orphaned item
+            entry.pop();
+
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+
+    async fn remove(
+        &self,
+        peer: &Peer,
+        id: u64,
+        address: Arc<str>,
+    ) -> Result<Option<SubscriberSender>> {
+        let _lock = self.write_mutex.lock().await;
+
+        if let Some(mut subscribers) = self.local_subscribers.get_mut(&address)
+            && let Some((index, _)) = subscribers.iter().enumerate().find(|(_, s)| {
+                let sender_id = match s {
+                    SubscriberSender::Unbounded { id: sender_id, .. } => *sender_id,
+                    SubscriberSender::Once { id: sender_id, .. } => *sender_id,
+                };
+                id == sender_id
+            })
+        {
+            let s = subscribers.swap_remove(index);
+
+            if subscribers.is_empty() {
+                // Drop `subscribers` so we can modify `local_subscribers`.
+                // Otherwise, `remove` will deadlock.
+                drop(subscribers);
+
+                self.local_subscribers.remove(&address);
+                self.remote_subscribers.remove(&address, peer).await?;
+            }
+
+            return Ok(Some(s));
+        }
+
+        Ok(None)
+    }
+
+    /// Removes all local subscribers and unregisters `peer` for their addresses.
+    async fn remove_all(&self, peer: &Peer) -> Result<()> {
+        let _lock = self.write_mutex.lock().await;
+
+        let mut addresses = Vec::with_capacity(self.local_subscribers.len());
+        self.local_subscribers.retain(|address, _| {
+            addresses.push(Arc::clone(address));
+            false
+        });
+
+        for address in addresses {
+            self.remote_subscribers.remove(&address, peer).await?;
+        }
+
+        Ok(())
+    }
 }
 
 /// A distributed event bus.
@@ -111,8 +202,7 @@ enum Subscriber {
 pub struct EventBus {
     endpoint: Endpoint,
     peer: Peer,
-    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
-    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    subscriber_maps: Arc<SubscriberMaps>,
     main_loop_handle: JoinHandle<()>,
 }
 
@@ -127,14 +217,18 @@ impl EventBus {
         let public_addr = config.public_addr.unwrap_or(local_addr);
 
         let peer = Peer::new(public_addr, config.public_server_name);
-        let local_subscribers = Arc::new(DashMap::new());
-        let remote_subscribers = Arc::new(cluster.get_multi_map("__dispost_subscribers"));
+        let local_subscribers = DashMap::new();
+        let remote_subscribers = cluster.get_multi_map("__dispost_subscribers");
+        let subscriber_maps = Arc::new(SubscriberMaps {
+            write_mutex: Mutex::default(),
+            local_subscribers,
+            remote_subscribers,
+        });
 
         // handle incoming messages
         let inner_endpoint = endpoint.clone();
         let inner_peer = Arc::new(peer.clone());
-        let inner_local_subscribers = Arc::clone(&local_subscribers);
-        let inner_remote_subscribers = Arc::clone(&remote_subscribers);
+        let inner_subscriber_maps = Arc::clone(&subscriber_maps);
         let main_loop_handle = tokio::spawn(async move {
             while let Some(conn) = inner_endpoint.accept().await {
                 if !conn.remote_address_validated() {
@@ -144,8 +238,7 @@ impl EventBus {
                     info!("accepting connection");
                     let fut = handle_connection(
                         conn,
-                        Arc::clone(&inner_local_subscribers),
-                        Arc::clone(&inner_remote_subscribers),
+                        Arc::clone(&inner_subscriber_maps),
                         Arc::clone(&inner_peer),
                     );
                     tokio::spawn(async move {
@@ -162,69 +255,68 @@ impl EventBus {
         Ok(Self {
             endpoint,
             peer,
-            local_subscribers,
-            remote_subscribers,
+            subscriber_maps,
             main_loop_handle,
         })
     }
 
     /// Shuts down the event bus.
-    pub async fn shutdown(self) -> Result<(), ShutdownEventBusError> {
+    pub async fn shutdown(self) -> Result<()> {
+        self.subscriber_maps.remove_all(&self.peer).await?;
         self.endpoint.close(0u32.into(), b"shutdown");
         self.endpoint.wait_idle().await;
         self.main_loop_handle.await?;
         Ok(())
     }
 
-    async fn subscribe_internal<A>(&self, address: A, subscriber: Subscriber) -> Result<()>
-    where
-        A: Into<String>,
-    {
-        let address: String = address.into();
-
-        let mut entry = self.local_subscribers.entry(address.clone()).or_default();
-        entry.push(subscriber);
-
-        self.remote_subscribers
-            .insert(address, self.peer.clone())
-            .await?;
-
-        Ok(())
-    }
-
     /// Subscribe to an address on the event bus.
     ///
     /// The method creates an unbounded in-memory message queue for messages
-    /// that arrive at the given address. It returns a receiver that can be used
-    /// to take messages from the queue.
-    ///
-    /// If the current cluster node already listens to the given address, the
-    /// method returns `None`.
-    pub async fn subscribe<A>(&self, address: A) -> Result<UnboundedReceiver<Arc<Message>>>
+    /// that arrive at the given address. It returns a subscriber that can be
+    /// used to take messages from the queue.
+    pub async fn subscribe<A>(&self, address: A) -> Result<UnboundedSubscriber>
     where
         A: Into<String>,
     {
+        let address = Arc::from(address.into());
         let (sender, receiver) = unbounded_channel();
-        self.subscribe_internal(address, Subscriber::Unbounded(sender))
+        let receiver = UnboundedSubscriber::new(Arc::clone(&address), receiver);
+        self.subscriber_maps
+            .add(
+                self.peer.clone(),
+                address,
+                SubscriberSender::Unbounded {
+                    id: receiver.id,
+                    sender,
+                },
+            )
             .await?;
         Ok(receiver)
     }
 
     /// Subscribe to receiving a single message at a certain event bus address.
     ///
-    /// The method creates a one-shot receiver that can be used to receive
-    /// exactly one message at the given address. Once the message is received,
-    /// the receiver cannot be used anymore.
-    ///
-    /// If the current cluster node already listens to the given address, the
-    /// method returns `None`.
-    pub async fn subscribe_once<A>(&self, address: A) -> Result<oneshot::Receiver<Arc<Message>>>
+    /// The method creates a subscriber that can be used to receive exactly one
+    /// message at the given address. Once the message is received, the
+    /// subscriber is automatically unregistered from the event bus and cannot
+    /// be used anymore.
+    pub async fn subscribe_once<A>(&self, address: A) -> Result<OnceSubscriber>
     where
         A: Into<String>,
     {
-        let address: String = address.into();
+        let address = Arc::from(address.into());
         let (sender, receiver) = oneshot::channel();
-        self.subscribe_internal(address.clone(), Subscriber::Once(address, sender))
+        let receiver = OnceSubscriber::new(Arc::clone(&address), receiver);
+        self.subscriber_maps
+            .add(
+                self.peer.clone(),
+                Arc::clone(&address),
+                SubscriberSender::Once {
+                    id: receiver.id,
+                    address,
+                    sender,
+                },
+            )
             .await?;
         Ok(receiver)
     }
@@ -273,7 +365,7 @@ impl EventBus {
         // select peer now and not in the `if let` statement below because `if
         // let` would borrow `rand::rng()` and we wouldn't be able to call
         // `.await` because `ThreadRng` is not `Send`
-        let subscribers = self.remote_subscribers.get(address).await?;
+        let subscribers = self.subscriber_maps.remote_subscribers.get(address).await?;
         let peer = subscribers.choose(&mut rand::rng());
 
         // TODO implement proper round-robin and other strategies
@@ -300,7 +392,7 @@ impl EventBus {
             reply_address: None,
         };
 
-        let subscribers = self.remote_subscribers.get(address).await?;
+        let subscribers = self.subscriber_maps.remote_subscribers.get(address).await?;
 
         if subscribers.is_empty() {
             return Err(Error::NoSubscriber {
@@ -320,18 +412,14 @@ impl EventBus {
     ///
     /// If there is no subscriber at the given address, the method returns
     /// [`Error::NoSubscriber`]. Otherwise, the method sends the message to
-    /// exactly one subscriber and returns a one-shot receiver that can be used
-    /// to receive the subscriber's reply.
+    /// exactly one subscriber and returns a new, temporary subscriber that can
+    /// be used to receive the reply.
     ///
     /// If there are multiple subscribers, the current implementation selects
     /// one at random. This may change in the future.
-    pub async fn request(
-        &self,
-        address: &str,
-        message: &[u8],
-    ) -> Result<oneshot::Receiver<Arc<Message>>> {
+    pub async fn request(&self, address: &str, message: &[u8]) -> Result<OnceSubscriber> {
         // TODO implement proper round-robin and other strategies
-        let ss = self.remote_subscribers.get(address).await?;
+        let ss = self.subscriber_maps.remote_subscribers.get(address).await?;
         let Some(remote_subscriber) = ss.choose(&mut rand::rng()) else {
             return Err(Error::NoSubscriber {
                 address: address.to_string(),
@@ -339,7 +427,7 @@ impl EventBus {
         };
 
         let reply_address = format!("__dispost_reply_{}", ulid::Ulid::generate());
-        let reply_receiver = self.subscribe_once(&reply_address).await?;
+        let reply_subscriber = self.subscribe_once(&reply_address).await?;
 
         let message = Message {
             address: address.to_string(),
@@ -350,7 +438,12 @@ impl EventBus {
         // TODO unsubscribe if send fails!
         self.send_to(remote_subscriber, &message).await?;
 
-        Ok(reply_receiver)
+        Ok(reply_subscriber)
+    }
+
+    pub(crate) async fn unsubscribe(&self, id: u64, address: Arc<str>) -> Result<()> {
+        self.subscriber_maps.remove(&self.peer, id, address).await?;
+        Ok(())
     }
 }
 
@@ -399,8 +492,7 @@ fn create_endpoint(
 
 async fn handle_connection(
     conn: Incoming,
-    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
-    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    subscriber_maps: Arc<SubscriberMaps>,
     peer: Arc<Peer>,
 ) -> Result<()> {
     let connection = conn.await.map_err(TransportError::from)?;
@@ -426,12 +518,11 @@ async fn handle_connection(
                 Ok(s) => s,
             };
 
-            let local_subscribers = Arc::clone(&local_subscribers);
-            let remote_subscribers = Arc::clone(&remote_subscribers);
+            let subscriber_maps = Arc::clone(&subscriber_maps);
             let peer = Arc::clone(&peer);
             tokio::spawn(
                 async move {
-                    handle_message(stream, local_subscribers, remote_subscribers, peer).await;
+                    handle_message(stream, subscriber_maps, peer).await;
                 }
                 .instrument(info_span!("handle_message")),
             );
@@ -444,8 +535,7 @@ async fn handle_connection(
 
 async fn handle_message(
     mut stream: RecvStream,
-    local_subscribers: Arc<DashMap<String, Vec<Subscriber>>>,
-    remote_subscribers: Arc<DMultiMap<String, Peer>>,
+    subscriber_maps: Arc<SubscriberMaps>,
     peer: Arc<Peer>,
 ) {
     let mut msg = Vec::new();
@@ -470,31 +560,66 @@ async fn handle_message(
         }
     };
 
-    if let Some(mut subscribers) = local_subscribers.get_mut(&msg.address) {
-        let oneshot_subscribers = subscribers.extract_if(.., |s| matches!(s, Subscriber::Once(..)));
+    // find all one-shot subscribers
+    let oneshot_subscriber_ids = subscriber_maps
+        .local_subscribers
+        .get_mut(msg.address.as_str())
+        .map(|subscribers| {
+            subscribers
+                .iter()
+                .filter_map(|s| {
+                    if let SubscriberSender::Once { id, address, .. } = s {
+                        Some((*id, Arc::clone(address)))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-        for s in oneshot_subscribers {
-            match s {
-                Subscriber::Once(address, sender) => {
-                    if sender.send(Arc::clone(&msg)).is_err() {
-                        error!("failed to forward incoming message to local oneshot subscriber");
-                    }
-                    if let Err(e) = remote_subscribers.remove(&address, &peer).await {
-                        error!("failed to unsubscribe oneshot subscriber: {e}");
-                    }
-                }
-                _ => unreachable!("collection only contains oneshot subscribers"),
+    // unsubscribe all one-shot subscribers
+    let mut oneshot_subscribers = Vec::new();
+    for (id, address) in oneshot_subscriber_ids {
+        match subscriber_maps.remove(&peer, id, address).await {
+            Ok(Some(s)) => oneshot_subscribers.push(s),
+            Ok(None) => {
+                // subscription was already removed by someone else
             }
+            Err(e) => error!("failed to unsubscribe one-shot subscriber: {e}"),
         }
+    }
 
+    // send to one-shot subscribers
+    for s in oneshot_subscribers {
+        match s {
+            SubscriberSender::Once {
+                address, sender, ..
+            } => {
+                if sender.send(Arc::clone(&msg)).is_err() {
+                    error!(
+                        "failed to forward incoming message to local one-shot \
+                        subscriber at address {address}"
+                    );
+                }
+            }
+            _ => unreachable!("collection only contains one-shot subscribers"),
+        }
+    }
+
+    // send to remaining subscribers
+    if let Some(subscribers) = subscriber_maps.local_subscribers.get(msg.address.as_str()) {
         for s in subscribers.iter() {
             match s {
-                Subscriber::Unbounded(sender) => {
+                SubscriberSender::Unbounded { sender, .. } => {
                     if let Err(e) = sender.send(Arc::clone(&msg)) {
                         error!("failed to forward incoming message to local subscriber: {e}");
                     }
                 }
-                Subscriber::Once(..) => unreachable!("already removed above"),
+                SubscriberSender::Once { .. } => {
+                    // A new one-shot subscriber was added in the meantime. It's
+                    // too late. Ignore it.
+                }
             }
         }
     }
@@ -510,7 +635,7 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::{select, time::timeout};
 
-    use crate::{EventBus, EventBusConfigBuilder, error::Error};
+    use crate::{EventBus, EventBusConfigBuilder, error::Error, subscribers::Subscriber as _};
 
     async fn setup_single_node() -> Result<(Cluster, EventBus)> {
         let CertifiedKey { cert, signing_key } =
@@ -573,8 +698,8 @@ mod tests {
     async fn send_single_node() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
 
-        let mut receiver = eventbus.subscribe("my_address").await?;
-        let handle = tokio::spawn(async move { receiver.recv().await });
+        let mut subscriber = eventbus.subscribe("my_address").await?;
+        let handle = tokio::spawn(async move { subscriber.recv().await });
 
         eventbus.send("my_address", b"hello").await?;
 
@@ -591,8 +716,8 @@ mod tests {
     async fn send_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver = eventbus2.subscribe("my_address").await?;
-        let handle = tokio::spawn(async move { receiver.recv().await });
+        let mut subscriber = eventbus2.subscribe("my_address").await?;
+        let handle = tokio::spawn(async move { subscriber.recv().await });
 
         eventbus1.send("my_address", b"hello").await?;
 
@@ -608,18 +733,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_multiple_receivers() -> Result<()> {
+    async fn send_multiple_subscribers() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver1 = eventbus1.subscribe("my_address").await?;
-        let mut receiver2 = eventbus2.subscribe("my_address").await?;
+        let mut subscriber1 = eventbus1.subscribe("my_address").await?;
+        let mut subscriber2 = eventbus2.subscribe("my_address").await?;
 
         eventbus1.send("my_address", b"hello").await?;
 
         let (mut other, msg) = timeout(Duration::from_secs(5), async {
             select! {
-                m = receiver1.recv() => (receiver2, m),
-                m = receiver2.recv() => (receiver1, m),
+                m = subscriber1.recv() => (subscriber2, m),
+                m = subscriber2.recv() => (subscriber1, m),
             }
         })
         .await
@@ -636,6 +761,31 @@ mod tests {
         );
 
         eventbus1.shutdown().await?;
+        eventbus2.shutdown().await?;
+        cluster1.shutdown().await?;
+        cluster2.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_and_recv_after_shutdown() -> Result<()> {
+        let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
+
+        let mut subscriber = eventbus1.subscribe("my_address").await?;
+        eventbus1.shutdown().await?;
+
+        // receiving should not be possible
+        assert!(subscriber.recv().await.is_none());
+
+        // sending from another node should not be possible anymore (subscriber
+        // should have been unregistered)
+        let Err(Error::NoSubscriber { address }) = eventbus2.send("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
         eventbus2.shutdown().await?;
         cluster1.shutdown().await?;
         cluster2.shutdown().await?;
@@ -663,10 +813,10 @@ mod tests {
     async fn publish_single_node() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
 
-        let mut receiver1 = eventbus.subscribe("my_address").await?;
-        let mut receiver2 = eventbus.subscribe("my_address").await?;
-        let handle1 = tokio::spawn(async move { receiver1.recv().await });
-        let handle2 = tokio::spawn(async move { receiver2.recv().await });
+        let mut subscriber1 = eventbus.subscribe("my_address").await?;
+        let mut subscriber2 = eventbus.subscribe("my_address").await?;
+        let handle1 = tokio::spawn(async move { subscriber1.recv().await });
+        let handle2 = tokio::spawn(async move { subscriber2.recv().await });
 
         eventbus.publish("my_address", b"hello").await?;
 
@@ -685,10 +835,10 @@ mod tests {
     async fn publish_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver1 = eventbus1.subscribe("my_address").await?;
-        let mut receiver2 = eventbus2.subscribe("my_address").await?;
-        let handle1 = tokio::spawn(async move { receiver1.recv().await });
-        let handle2 = tokio::spawn(async move { receiver2.recv().await });
+        let mut subscriber1 = eventbus1.subscribe("my_address").await?;
+        let mut subscriber2 = eventbus2.subscribe("my_address").await?;
+        let handle1 = tokio::spawn(async move { subscriber1.recv().await });
+        let handle2 = tokio::spawn(async move { subscriber2.recv().await });
 
         eventbus1.publish("my_address", b"hello").await?;
 
@@ -727,20 +877,20 @@ mod tests {
         let eventbus = Arc::new(eventbus);
 
         let inner_eventbus = Arc::clone(&eventbus);
-        let mut receiver = eventbus.subscribe("my_address").await?;
+        let mut subscriber = eventbus.subscribe("my_address").await?;
         let handle = tokio::spawn(async move {
-            let msg = receiver.recv().await.context("no message received")?;
+            let msg = subscriber.recv().await.context("no message received")?;
             let reply = msg.body.to_ascii_uppercase();
             let reply_address = msg.reply_address.as_ref().context("no reply address")?;
             inner_eventbus.send(reply_address, &reply).await?;
             anyhow::Ok(())
         });
 
-        let reply_receiver = eventbus.request("my_address", b"hello").await?;
+        let reply_subscriber = eventbus.request("my_address", b"hello").await?;
 
         handle.await??;
 
-        let reply = reply_receiver.await?;
+        let reply = reply_subscriber.await?;
         assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
 
         Arc::into_inner(eventbus).unwrap().shutdown().await?;
@@ -753,9 +903,9 @@ mod tests {
     async fn request_two_nodes() -> Result<()> {
         let ((cluster1, eventbus1), (cluster2, eventbus2)) = setup_two_nodes().await?;
 
-        let mut receiver = eventbus2.subscribe("my_address").await?;
+        let mut subscriber = eventbus2.subscribe("my_address").await?;
         let handle = tokio::spawn(async move {
-            let msg = receiver.recv().await.context("no message received")?;
+            let msg = subscriber.recv().await.context("no message received")?;
             let reply = msg.body.to_ascii_uppercase();
             let reply_address = msg.reply_address.as_ref().context("no reply address")?;
             eventbus2.send(reply_address, &reply).await?;
@@ -763,11 +913,11 @@ mod tests {
             anyhow::Ok(())
         });
 
-        let reply_receiver = eventbus1.request("my_address", b"hello").await?;
+        let reply_subscriber = eventbus1.request("my_address", b"hello").await?;
 
         handle.await??;
 
-        let reply = reply_receiver.await?;
+        let reply = reply_subscriber.await?;
         assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
 
         eventbus1.shutdown().await?;
@@ -781,8 +931,8 @@ mod tests {
     async fn subscribe_once_send() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
 
-        let receiver = eventbus.subscribe_once("my_address").await?;
-        let handle = tokio::spawn(receiver);
+        let subscriber = eventbus.subscribe_once("my_address").await?;
+        let handle = tokio::spawn(subscriber);
 
         eventbus.send("my_address", b"hello").await?;
 
@@ -806,8 +956,8 @@ mod tests {
     async fn subscribe_once_publish() -> Result<()> {
         let (cluster, eventbus) = setup_single_node().await?;
 
-        let receiver = eventbus.subscribe_once("my_address").await?;
-        let handle = tokio::spawn(receiver);
+        let subscriber = eventbus.subscribe_once("my_address").await?;
+        let handle = tokio::spawn(subscriber);
 
         eventbus.publish("my_address", b"hello").await?;
 
@@ -832,21 +982,21 @@ mod tests {
         let (cluster, eventbus) = setup_single_node().await?;
         let eventbus = Arc::new(eventbus);
 
-        let receiver = eventbus.subscribe_once("my_address").await?;
+        let subscriber = eventbus.subscribe_once("my_address").await?;
         let inner_eventbus = Arc::clone(&eventbus);
         let handle = tokio::spawn(async move {
-            let msg = receiver.await.context("no message received")?;
+            let msg = subscriber.await.context("no message received")?;
             let reply = msg.body.to_ascii_uppercase();
             let reply_address = msg.reply_address.as_ref().context("no reply address")?;
             inner_eventbus.send(reply_address, &reply).await?;
             anyhow::Ok(())
         });
 
-        let reply_receiver = eventbus.request("my_address", b"hello").await?;
+        let reply_subscriber = eventbus.request("my_address", b"hello").await?;
 
         handle.await??;
 
-        let reply = reply_receiver.await?;
+        let reply = reply_subscriber.await?;
         assert_eq!("HELLO".as_bytes().to_vec(), reply.body);
 
         // subscriber should not be there anymore
@@ -857,6 +1007,25 @@ mod tests {
         assert_eq!(address, "my_address");
 
         Arc::into_inner(eventbus).unwrap().shutdown().await?;
+        cluster.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsubscribe() -> Result<()> {
+        let (cluster, eventbus) = setup_single_node().await?;
+
+        let subscriber = eventbus.subscribe("my_address").await?;
+        subscriber.unsubscribe(&eventbus).await?;
+
+        let Err(Error::NoSubscriber { address }) = eventbus.send("my_address", b"hello").await
+        else {
+            bail!("expected error")
+        };
+        assert_eq!(address, "my_address");
+
+        eventbus.shutdown().await?;
         cluster.shutdown().await?;
 
         Ok(())

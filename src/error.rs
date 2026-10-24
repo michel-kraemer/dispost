@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("no subscriber for address `{address}'")]
     NoSubscriber { address: String },
+
+    #[error("failed to join asynchronous task: {0}")]
+    Join(#[from] JoinError),
 }
 
 /// An error that can happen when creating an [`EventBus`](crate::EventBus).
@@ -37,12 +40,6 @@ pub enum CreateError {
 
     #[error("failed to create endpoint: {0}")]
     CreateEndpoint(#[source] std::io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ShutdownEventBusError {
-    #[error("failed to join asynchronous task: {0}")]
-    Join(#[from] JoinError),
 }
 
 /// An error that can happen when configuring an [`EventBus`](crate::EventBus).

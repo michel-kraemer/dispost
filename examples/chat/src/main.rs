@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-    let mut receiver = eventbus.subscribe(ADDRESS).await?;
+    let mut subscriber = eventbus.subscribe(ADDRESS).await?;
     info!("Subscribed to '{ADDRESS}'");
 
     let (mut rl, mut stdout) = Readline::new("> ".to_owned())?;
@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
                 break;
             },
 
-            msg = receiver.recv() => {
+            msg = subscriber.recv() => {
                 let Some(msg) = msg else {
                     break;
                 };

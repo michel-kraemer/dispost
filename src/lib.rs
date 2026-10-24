@@ -52,8 +52,8 @@
 //!
 //! ```no_run
 //! # async fn recv(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut receiver = eventbus.subscribe("my_address").await?;
-//! while let Some(message) = receiver.recv().await {
+//! let mut subscriber = eventbus.subscribe("my_address").await?;
+//! while let Some(message) = subscriber.recv().await {
 //!     // do something with `message`, for example:
 //!     println!("{}", std::str::from_utf8(&message.body)?);
 //! }
@@ -97,8 +97,8 @@
 //!
 //! ```no_run
 //! # async fn recv(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut receiver = eventbus.subscribe("uppercase").await?;
-//! while let Some(message) = receiver.recv().await {
+//! let mut subscriber = eventbus.subscribe("uppercase").await?;
+//! while let Some(message) = subscriber.recv().await {
 //!     if let Some(reply_address) = &message.reply_address {
 //!         let reply = message.body.to_ascii_uppercase();
 //!         eventbus.send(&reply_address, &reply).await?;
@@ -113,8 +113,8 @@
 //!
 //! ```no_run
 //! # async fn req(eventbus: dispost::EventBus) -> Result<(), Box<dyn std::error::Error>> {
-//! let receiver = eventbus.request("uppercase", b"Hello world").await?;
-//! let reply = receiver.await?;
+//! let subscriber = eventbus.request("uppercase", b"Hello world").await?;
+//! let reply = subscriber.await?;
 //! assert_eq!("HELLO WORLD", std::str::from_utf8(&reply.body)?);
 //! # Ok(())
 //! # }
@@ -127,6 +127,7 @@ pub mod error;
 mod eventbus;
 mod message;
 mod peer;
+pub mod subscribers;
 
 pub use eventbus::{EventBus, EventBusConfig, EventBusConfigBuilder};
 pub use message::Message;
