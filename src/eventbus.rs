@@ -286,13 +286,14 @@ impl EventBus {
             reply_address: None,
         };
 
+        // select peer now and not in the `if let` statement below because `if
+        // let` would borrow `rand::rng()` and we wouldn't be able to call
+        // `.await` because `ThreadRng` is not `Send`
+        let subscribers = self.remote_subscribers.get(address).await?;
+        let peer = subscribers.choose(&mut rand::rng());
+
         // TODO implement proper round-robin and other strategies
-        if let Some(s) = self
-            .remote_subscribers
-            .get(address)
-            .await?
-            .choose(&mut rand::rng())
-        {
+        if let Some(s) = peer {
             self.send_to(s, &message).await
         } else {
             Ok(())
@@ -354,7 +355,9 @@ impl EventBus {
             reply_address: Some(reply_address),
         };
 
+        // TODO unsubscribe if send fails!
         self.send_to(remote_subscriber, &message).await?;
+
         Ok(Some(reply))
     }
 }
