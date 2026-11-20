@@ -543,9 +543,9 @@ dependencies = [
 
 [[package]]
 name = "distruct"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d41f36cb87c5e0c12258e7b53a7cc172491bfa2c33b89eeae3445b7cc3f3b689"
+checksum = "b92e7b5560e4235743c68ad8b4a5863f2046ed7b3785c1bd57e900cfe1ef229c"
 dependencies = [
  "dashmap",
  "log",
